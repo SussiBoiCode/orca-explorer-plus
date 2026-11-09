@@ -1,0 +1,40 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Explorer+</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div id="app">
+      <div class="toolbar">
+        <span class="title" id="title"></span>
+        <button class="icon-btn" id="btn-sort" type="button" aria-haspopup="menu" aria-label="Sort"></button>
+        <button class="icon-btn" id="btn-new" type="button" aria-haspopup="menu" aria-label="New File or Folder"></button>
+        <button class="icon-btn" id="btn-collapse" type="button" aria-label="Collapse All"></button>
+        <button class="icon-btn" id="btn-refresh" type="button" aria-label="Refresh Explorer"></button>
+      </div>
+      <div class="filter-wrap">
+        <label class="filter">
+          <span id="filter-icon"></span>
+          <input id="filter" type="text" spellcheck="false" autocomplete="off" placeholder="Filter by name" aria-label="Filter by name" />
+          <span id="filter-busy"></span>
+          <button class="icon-btn clear" id="filter-clear" type="button" aria-label="Clear filter" hidden></button>
+        </label>
+      </div>
+      <div class="crumbs" id="crumbs" hidden>
+        <button class="icon-btn" id="btn-up" type="button" aria-label="Up one level"></button>
+        <div class="crumb-list" id="crumb-list"></div>
+        <button class="icon-btn" id="btn-unfocus" type="button" aria-label="Show full tree"></button>
+      </div>
+      <div class="tree" id="tree" tabindex="0" role="tree" aria-label="Files" aria-multiselectable="true">
+        <div class="spacer" id="spacer"></div>
+        <div id="tree-msg"></div>
+      </div>
+    </div>
+    <div class="toasts" id="toasts"></div>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

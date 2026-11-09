@@ -1,0 +1,24 @@
+{
+  "manifestVersion": 2,
+  "id": "explorer-plus",
+  "name": "Explorer+",
+  "version": "1.0.0",
+  "description": "A file explorer panel you can sort by name, date created or date modified, with a 'show only this folder' focus mode.",
+  "repository": "https://github.com/SussiBoiCode/orca-explorer-plus",
+  "license": "MIT",
+  "engines": { "orca": ">=1.4.248" },
+  "execution": "trusted-worker",
+  "pluginApi": 1,
+  "main": "src/worker.ts",
+  "contributes": {
+    "panels": [
+      {
+        "id": "explorer",
+        "title": "Explorer+",
+        "icon": "folder",
+        "entry": "panel/index.html"
+      }
+    ]
+  },
+  "capabilities": [{ "kind": "workspace:read" }, { "kind": "workspace:write" }]
+}

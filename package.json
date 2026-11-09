@@ -1,0 +1,19 @@
+{
+  "name": "orca-explorer-plus",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Explorer+ for Orca: a file explorer panel sortable by name, date created or date modified.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "harness": "node tools/harness.mjs",
+    "test:e2e": "node tests/e2e.mjs",
+    "validate": "orca plugin validate ."
+  },
+  "devDependencies": {
+    "playwright-core": "1.56.1"
+  },
+  "engines": {
+    "node": ">=23.6"
+  }
+}
