@@ -5,7 +5,7 @@ import type { OrcaWorkerApi } from 'orca/worker'
 import { promises as fs, watch, type FSWatcher, type Dirent } from 'node:fs'
 import path from 'node:path'
 import os from 'node:os'
-import { execFile } from 'node:child_process'
+import { execFile, spawn } from 'node:child_process'
 
 /** Always hidden, as in Orca's own explorer. */
 const ALWAYS_HIDDEN = new Set(['.git', 'node_modules'])
@@ -289,8 +289,18 @@ async function trash(paths: string[]): Promise<{ failed: { path: string; error: 
 
 async function reveal(abs: string): Promise<void> {
   if (process.platform === 'win32') {
-    // explorer.exe exits 1 even when it worked, so the result is not checked.
-    await run('explorer.exe', [`/select,${abs}`])
+    // Not through run(): its windowsHide reaches the Explorer window, which then opens hidden.
+    // Explorer reads `/select,"C:\a b\c"` but not Node's quoting `"/select,C:\a b\c"` (it opens
+    // Documents), so the argument goes out verbatim. Its exit code means nothing, so not awaited.
+    const explorer = path.join(process.env.SystemRoot ?? process.env.windir ?? 'C:\\Windows', 'explorer.exe')
+    const child = spawn(explorer, [`/select,"${abs}"`], {
+      windowsVerbatimArguments: true,
+      windowsHide: false,
+      detached: true,
+      stdio: 'ignore'
+    })
+    child.on('error', () => {})
+    child.unref()
   } else if (process.platform === 'darwin') {
     await run('open', ['-R', abs])
   } else {
@@ -376,6 +386,118 @@ async function terminalFolder(terminalId: string): Promise<string | null> {
     terminalFolders.set(terminalId, folder)
   }
   return folder
+}
+
+// ---------- Orca's app font ----------
+// The plugin API gives frames no font, so the font picked in Settings → Appearance is read from
+// Orca's own profile store: `appFontFamily` in the `settings` document of profile-state.db.
+
+/** Orca's userData folders to try, most likely first. */
+function orcaDataDirs(): string[] {
+  const home = os.homedir()
+  const base =
+    process.platform === 'win32'
+      ? process.env.APPDATA ?? path.join(home, 'AppData', 'Roaming')
+      : process.platform === 'darwin'
+        ? path.join(home, 'Library', 'Application Support')
+        : process.env.XDG_CONFIG_HOME ?? path.join(home, '.config')
+  return [path.join(base, 'orca'), path.join(base, 'Orca')]
+}
+
+async function activeProfileDir(): Promise<string | null> {
+  for (const dir of orcaDataDirs()) {
+    let id = 'local-default'
+    try {
+      const index = JSON.parse(await fs.readFile(path.join(dir, 'orca-profile-index.json'), 'utf8'))
+      if (typeof index?.activeProfileId === 'string' && /^[\w.-]+$/.test(index.activeProfileId)) {
+        id = index.activeProfileId
+      }
+    } catch {
+      // No index: the default profile.
+    }
+    const profile = path.join(dir, 'profiles', id)
+    if (await exists(profile)) {
+      return profile
+    }
+  }
+  return null
+}
+
+type SqliteModule = { DatabaseSync: new (file: string, options?: { readOnly?: boolean }) => {
+  prepare(sql: string): { get(...params: unknown[]): unknown }
+  close(): void
+} }
+let sqlite: SqliteModule | null | undefined
+
+async function loadSqlite(): Promise<SqliteModule | null> {
+  if (sqlite === undefined) {
+    try {
+      sqlite = (await import('node:sqlite' as string)) as SqliteModule
+    } catch {
+      sqlite = null
+    }
+  }
+  return sqlite
+}
+
+const FONT_KEY = /"appFontFamily"\s*:\s*("(?:[^"\\]|\\.)*")/g
+
+/** Last `"appFontFamily":"…"` in a file's raw bytes (the fallback when node:sqlite is missing). */
+async function scanFontFamily(file: string): Promise<string | undefined> {
+  let text: string
+  try {
+    text = (await fs.readFile(file)).toString('latin1')
+  } catch {
+    return undefined
+  }
+  let found: string | undefined
+  for (const match of text.matchAll(FONT_KEY)) {
+    try {
+      // latin1 → bytes → utf8, so non-ASCII family names come back intact.
+      found = JSON.parse(Buffer.from(match[1], 'latin1').toString('utf8'))
+    } catch {
+      // A match cut across pages; keep the last good one.
+    }
+  }
+  return found
+}
+
+type FontAnswer = { family: string; source: 'sqlite' | 'scan' | 'none' }
+
+/** The app font family Orca is set to; '' when it is the default (Geist). */
+async function readAppFontFamily(): Promise<FontAnswer> {
+  const profile = await activeProfileDir()
+  if (!profile) {
+    return { family: '', source: 'none' }
+  }
+  const dbFile = path.join(profile, 'profile-state.db')
+  const mod = await loadSqlite()
+  if (mod && (await exists(dbFile))) {
+    try {
+      const db = new mod.DatabaseSync(dbFile, { readOnly: true })
+      try {
+        const row = db.prepare("SELECT payload FROM profile_state_documents WHERE domain = 'settings'").get() as
+          | { payload?: unknown }
+          | undefined
+        if (row && typeof row.payload === 'string') {
+          const value = JSON.parse(row.payload)?.appFontFamily
+          return { family: typeof value === 'string' ? value.trim() : '', source: 'sqlite' }
+        }
+      } finally {
+        db.close()
+      }
+    } catch {
+      // Locked or a changed schema: fall through to the raw scan.
+    }
+  }
+  // Newest writes sit in the WAL until a checkpoint; the legacy JSON store is the last resort.
+  for (const file of [`${dbFile}-wal`, dbFile, path.join(profile, 'orca-data.json')]) {
+    const value = await scanFontFamily(file)
+    if (value !== undefined) {
+      return { family: value.trim(), source: 'scan' }
+    }
+  }
+  return { family: '', source: 'none' }
 }
 
 type WatchState = {
@@ -592,6 +714,78 @@ export default function activate(orca: OrcaWorkerApi): void {
     return { moved, failed }
   })
 
+  // ---- copying in files dropped from the OS ----
+  // A frame cannot learn a dropped file's path on disk, so the panel reads each file and sends its
+  // bytes here in base64 chunks small enough for the request cap.
+
+  /** Which of `names` already exist in `dir`, and whether each is a folder. */
+  orca.panels.handle('fs.conflicts', async (input) => {
+    const { root, dir, names } = obj(input)
+    const r = str(root, 'root')
+    const parent = inside(r, str(dir, 'dir'))
+    const conflicts: { name: string; dir: boolean }[] = []
+    for (const name of strList(names, 'names')) {
+      try {
+        const st = await fs.stat(path.join(parent, validName(name)))
+        conflicts.push({ name, dir: st.isDirectory() })
+      } catch {
+        // Missing (or an invalid name, which fs.write refuses later): no conflict.
+      }
+    }
+    return { conflicts }
+  })
+
+  /** A name free in `dir` for a copy of `name`: 'a copy.txt', 'a copy 2.txt', ... */
+  orca.panels.handle('fs.freeName', async (input) => {
+    const { root, dir, name, isDir } = obj(input)
+    const r = str(root, 'root')
+    const parent = inside(r, str(dir, 'dir'))
+    const clean = validName(str(name, 'name'))
+    // Folders keep dots in their name; files keep their extension ('.gitignore' has none).
+    const ext = isDir === true ? '' : path.extname(clean)
+    const stem = clean.slice(0, clean.length - ext.length)
+    for (let n = 1; n < 10_000; n++) {
+      const candidate = `${stem} copy${n === 1 ? '' : ` ${n}`}${ext}`
+      if (!(await exists(path.join(parent, candidate)))) {
+        return { name: candidate }
+      }
+    }
+    fail(`No free name for '${clean}'.`, 'conflict')
+  })
+
+  orca.panels.handle('fs.mkdir', async (input) => {
+    const { root, path: rel } = obj(input)
+    const r = str(root, 'root')
+    const target = inside(r, str(rel, 'path'))
+    for (const part of str(rel, 'path').split('/').filter(Boolean)) {
+      validName(part)
+    }
+    await fs.mkdir(target, { recursive: true })
+    return { path: toRel(r, target) }
+  })
+
+  /** Writes one chunk: the first (append false) creates the file and fails if it exists. */
+  orca.panels.handle('fs.write', async (input) => {
+    const { root, path: rel, data, append } = obj(input)
+    const r = str(root, 'root')
+    const relPath = str(rel, 'path')
+    const target = inside(r, relPath)
+    if (target === path.resolve(r)) {
+      fail('The workspace root cannot be written.', 'invalid_params')
+    }
+    const name = validName(path.basename(target))
+    const bytes = Buffer.from(str(data, 'data'), 'base64')
+    try {
+      await fs.writeFile(target, bytes, { flag: append === true ? 'a' : 'wx' })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'EEXIST') {
+        fail(`'${name}' already exists here.`, 'conflict')
+      }
+      throw error
+    }
+    return { path: toRel(r, target) }
+  })
+
   orca.panels.handle('fs.trash', async (input) => {
     const { root, paths } = obj(input)
     const r = str(root, 'root')
@@ -628,6 +822,8 @@ export default function activate(orca: OrcaWorkerApi): void {
     await reveal(inside(str(root, 'root'), str(rel, 'path')))
     return { ok: true }
   })
+
+  orca.panels.handle('app.font', () => readAppFontFamily())
 
   orca.panels.handle('editor.open', async (input) => {
     const { workspaceId, root, path: rel } = obj(input)

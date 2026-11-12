@@ -68,7 +68,8 @@ body {
   overflow: hidden;
   background: var(--panel-bg);
   color: var(--fg);
-  font-family: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  /* --app-font is Orca's own stack for the font picked in Settings (set by app.js). */
+  font-family: var(--app-font, 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif);
   font-size: 12px;
   line-height: 16px;
   -webkit-font-smoothing: antialiased;
@@ -569,6 +570,63 @@ svg.icon {
 .btn.destructive:hover {
   background: color-mix(in srgb, var(--destructive) 90%, #000);
 }
+.btn.primary {
+  border-color: transparent;
+  background: var(--primary);
+  color: var(--primary-fg);
+}
+.btn.primary:hover {
+  background: color-mix(in srgb, var(--primary) 90%, var(--bg));
+}
+.dialog .actions {
+  flex-wrap: wrap;
+}
+.dialog .actions .btn {
+  padding: 0 10px;
+}
+.dialog .actions.stack {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+}
+.btn.ghost {
+  border-color: transparent;
+  color: var(--muted-fg);
+}
+.check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: -4px 0 14px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.check-row input {
+  margin: 0;
+  accent-color: var(--primary);
+}
+.dialog-input {
+  display: block;
+  width: 100%;
+  height: 28px;
+  margin: 4px 0 14px;
+  padding: 0 8px;
+  border: 1px solid var(--input);
+  border-radius: 6px;
+  outline: none;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  user-select: text;
+}
+.dialog-input:focus {
+  border-color: var(--ring);
+}
+.dialog-error {
+  margin: -10px 0 12px;
+  color: var(--destructive);
+  word-break: break-word;
+}
 .btn:focus-visible {
   outline: 2px solid var(--ring);
   outline-offset: 1px;
@@ -596,6 +654,29 @@ svg.icon {
   line-height: 16px;
   word-break: break-word;
   pointer-events: auto;
+}
+.toast.progress {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.toast-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.toast-bar {
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+  overflow: hidden;
+}
+.toast-bar > span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--primary);
+  transition: width 120ms linear;
 }
 .toast.error {
   border-color: color-mix(in srgb, var(--destructive) 60%, var(--border));

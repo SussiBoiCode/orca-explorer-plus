@@ -1,11 +1,13 @@
 // Runs the Explorer+ panel in a normal browser against the real worker, outside Orca, for
 // development and automated tests. Needs Node 23.6+ (it imports src/worker.ts with type stripping).
 //
-//   node tools/harness.mjs <folder to show> [--port 4870] [--theme dark|light]
+//   node tools/harness.mjs <folder to show> [--port 4870] [--theme dark|light] [--record-reveal]
 //
 // Then open http://localhost:4870/. The page gets a stand-in `window.orca` whose
 // plugin.request calls the worker's handlers in this process; editor.open calls are recorded
-// at /__state instead of opening anything.
+// at /__state instead of opening anything. With --record-reveal, fs.reveal calls are recorded
+// there too instead of opening File Explorer. POST /__font?family=X makes app.font answer X
+// (an empty family = Orca's default) instead of reading Orca's real settings.
 import http from 'node:http'
 import { readFile } from 'node:fs/promises'
 import path from 'node:path'
@@ -15,6 +17,7 @@ const args = process.argv.slice(2)
 const root = args.find((a) => !a.startsWith('--'))
 const port = Number(args[args.indexOf('--port') + 1]) || 4870
 const theme = args.includes('--theme') ? args[args.indexOf('--theme') + 1] : 'dark'
+const recordReveal = args.includes('--record-reveal')
 if (!root) {
   console.error('usage: node tools/harness.mjs <folder> [--port 4870] [--theme dark|light]')
   process.exit(2)
@@ -41,7 +44,7 @@ const TOKENS = {
   }
 }
 
-const state = { opened: [], logs: [] }
+const state = { opened: [], revealed: [], font: null, logs: [] }
 const handlers = new Map()
 const clients = new Set()
 const workspace = { id: 'ws-harness', name: 'harness', path: ROOT, kind: 'folder', branch: null, hostId: 'local' }
@@ -78,6 +81,15 @@ const orca = {
 
 const worker = await import(new URL('../src/worker.ts', import.meta.url).href)
 await worker.default(orca)
+
+if (recordReveal) {
+  handlers.set('fs.reveal', async (input) => {
+    state.revealed.push(input)
+    return { ok: true }
+  })
+}
+const realFont = handlers.get('app.font')
+handlers.set('app.font', async (...a) => (state.font === null ? realFont(...a) : { family: state.font, source: 'harness' }))
 
 const mockScript = (t) => `
 <script>
@@ -153,8 +165,14 @@ http
         res.end(JSON.stringify(state))
         return
       }
+      if (url.pathname === '/__font' && req.method === 'POST') {
+        state.font = url.searchParams.get('family')
+        res.end('ok')
+        return
+      }
       if (url.pathname === '/__reset') {
         state.opened = []
+        state.revealed = []
         res.end('ok')
         return
       }

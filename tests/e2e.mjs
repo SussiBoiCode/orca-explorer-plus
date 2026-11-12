@@ -6,7 +6,7 @@
 // The delete step moves one small fixture file to the Recycle Bin / Trash.
 import { chromium } from 'playwright-core'
 import { spawn } from 'node:child_process'
-import { mkdir, writeFile, rm, utimes, readdir, stat } from 'node:fs/promises'
+import { mkdir, writeFile, readFile, rm, utimes, readdir, stat } from 'node:fs/promises'
 import path from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
@@ -67,7 +67,7 @@ const created = {}
 for (const [name] of order) created[name] = (await stat(path.join(FIX, name))).birthtimeMs
 
 // ---- harness ----
-const server = spawn(process.execPath, [path.join(PLUGIN, 'tools/harness.mjs'), FIX, '--port', String(PORT)], { stdio: ['ignore', 'pipe', 'pipe'] })
+const server = spawn(process.execPath, [path.join(PLUGIN, 'tools/harness.mjs'), FIX, '--port', String(PORT), '--record-reveal'], { stdio: ['ignore', 'pipe', 'pipe'] })
 let serverErr = ''
 server.stderr.on('data', (d) => (serverErr += d))
 await new Promise((resolve, reject) => {
@@ -293,6 +293,193 @@ try {
   await page.click('#btn-collapse')
   await sleep(100)
   check((await paths()).every((p) => !p.includes('/')), 'collapse all closes every folder')
+
+  console.log('app font')
+  const setFont = (family) => fetch(`${URL_}__font?family=${encodeURIComponent(family)}`, { method: 'POST' })
+  const bodyFont = () => page.$eval('.row[data-path] .name', (e) => getComputedStyle(e).fontFamily)
+  await setFont('Courier New')
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  check(await waitFor(async () => (await bodyFont()).startsWith('"Courier New", Geist'), 'font'), "rows use Orca's app font with Orca's fallbacks", await bodyFont())
+  check((await page.evaluate(() => localStorage.getItem('xp:font'))) === '"Courier New"', 'the font is remembered for the next start')
+  await setFont('')
+  await page.evaluate(() => window.dispatchEvent(new Event('focus')))
+  check(await waitFor(async () => (await bodyFont()).startsWith('Geist, -apple-system'), 'font'), 'an unset app font falls back to Geist', await bodyFont())
+  await setFont('Arial')
+  check(await waitFor(async () => (await bodyFont()).startsWith('Arial'), 'font', 8000), 'a font change is picked up without focus (poll)', await bodyFont())
+  await setFont('')
+
+  console.log('alt+click reveal')
+  await fetch(`${URL_}__reset`)
+  await row('zeta').click({ modifiers: ['Alt'] })
+  check(await waitFor(async () => (await serverState()).revealed.some((r) => r.path === 'zeta'), 'reveal'), 'alt+click a folder reveals it')
+  check(!(await paths()).includes('zeta/z1.txt'), 'alt+click does not expand the folder')
+  check(
+    await waitFor(async () => (await page.$$eval('.row[data-selected="true"]', (els) => els.map((e) => e.dataset.path).join())) === 'zeta', 'sel'),
+    'alt+click selects the row'
+  )
+  await row('.env').click({ modifiers: ['Alt'] })
+  check(await waitFor(async () => (await serverState()).revealed.some((r) => r.path === '.env'), 'reveal'), 'alt+click a file reveals it')
+  check(!(await serverState()).opened.some((o) => o.path === '.env'), 'alt+click does not open the file')
+  await row('.env').click({ button: 'right' })
+  const revealItem = page.locator('.menu .menu-item', { hasText: 'Reveal in' })
+  check((await revealItem.locator('.shortcut').textContent()) === 'Alt+Click', 'the menu shows the Alt+Click shortcut')
+  await revealItem.click()
+  check(await waitFor(async () => (await serverState()).revealed.filter((r) => r.path === '.env').length === 2, 'reveal'), 'menu reveal still works')
+
+  console.log('drop from the OS')
+  // A drop as File Explorer makes it. Real OS folders come through webkitGetAsEntry, which a
+  // synthetic DataTransfer lacks, so `dir` specs are handed to the panel as stand-in entries.
+  await page.evaluate(() => {
+    const toFile = (spec) =>
+      new File([spec.size ? new Uint8Array(spec.size).map((_, i) => (i * 7) & 255) : spec.content ?? ''], spec.name)
+    const toEntry = (spec) =>
+      spec.dir
+        ? {
+            name: spec.name,
+            isFile: false,
+            isDirectory: true,
+            createReader() {
+              let done = false
+              return {
+                readEntries(ok) {
+                  ok(done ? [] : spec.children.map(toEntry))
+                  done = true
+                }
+              }
+            }
+          }
+        : { name: spec.name, isFile: true, isDirectory: false, file: (ok) => ok(toFile(spec)) }
+    window.__drop = (selector, specs) => {
+      const target = document.querySelector(selector)
+      const dt = new DataTransfer()
+      const fakes = []
+      for (const spec of specs) {
+        dt.items.add(spec.dir ? new File([''], spec.name) : toFile(spec))
+        fakes.push(spec.dir ? toEntry(spec) : null)
+      }
+      const real = DataTransferItem.prototype.webkitGetAsEntry
+      let i = 0
+      DataTransferItem.prototype.webkitGetAsEntry = function () {
+        return fakes[i++]
+      }
+      const at = target.getBoundingClientRect()
+      const opts = { bubbles: true, cancelable: true, dataTransfer: dt, clientX: at.left + 20, clientY: at.top + 8 }
+      target.dispatchEvent(new DragEvent('dragenter', opts))
+      target.dispatchEvent(new DragEvent('dragover', opts))
+      const highlighted = document.querySelector('.slot.drop, .tree.drop-root') !== null
+      target.dispatchEvent(new DragEvent('drop', opts))
+      DataTransferItem.prototype.webkitGetAsEntry = real
+      return highlighted
+    }
+  })
+  const drop = (selector, specs) => page.evaluate(([sel, sp]) => window.__drop(sel, sp), [selector, specs])
+  const zetaFile = (n) => readFile(path.join(FIX, 'zeta', n), 'utf8').catch(() => null)
+  const dialog = () => page.locator('.backdrop .dialog')
+
+  check(await drop('.row[data-path="zeta"]', [{ name: 'dropped.txt', content: 'hello' }]), 'an OS drag highlights the drop folder')
+  check(await waitFor(async () => (await zetaFile('dropped.txt')) === 'hello', 'disk'), 'dropping a file onto a folder copies it there')
+  check(await waitFor(async () => (await paths()).includes('zeta/dropped.txt'), 'row'), 'the copied file is revealed and selected')
+  check(await waitFor(async () => (await page.locator('.toast.progress').count()) === 0, 'toast'), 'the progress toast goes away when done')
+
+  const BIG = 1_300_000
+  // A local copy is too quick to poll for, so the toast's text is caught as it changes.
+  await page.evaluate(() => {
+    window.__progress = []
+    new MutationObserver(() => {
+      const t = document.querySelector('.toast.progress .toast-text')?.textContent
+      if (t && window.__progress.at(-1) !== t) window.__progress.push(t)
+    }).observe(document.getElementById('toasts'), { subtree: true, childList: true, characterData: true })
+  })
+  await drop('#spacer', [{ name: 'big.bin', size: BIG }])
+  check(
+    await waitFor(async () => (await page.evaluate(() => window.__progress)).some((t) => t.startsWith('Copying 1 of 1: big.bin')), 'progress', 4000),
+    'a copy shows a progress toast',
+    JSON.stringify(await page.evaluate(() => window.__progress))
+  )
+  check(
+    await waitFor(async () => {
+      const b = await readFile(path.join(FIX, 'big.bin')).catch(() => null)
+      return b !== null && b.length === BIG && b.every((v, i) => v === ((i * 7) & 255))
+    }, 'disk', 15000),
+    'a multi-chunk file arrives byte for byte'
+  )
+
+  await drop('#spacer', [
+    {
+      name: 'pack',
+      dir: true,
+      children: [
+        { name: 'a.txt', content: 'A' },
+        { name: 'sub', dir: true, children: [{ name: 'b.txt', content: 'B' }] },
+        { name: 'empty', dir: true, children: [] }
+      ]
+    }
+  ])
+  check(
+    await waitFor(async () => (await readFile(path.join(FIX, 'pack', 'sub', 'b.txt'), 'utf8').catch(() => null)) === 'B', 'disk'),
+    'dropping a folder copies its whole tree'
+  )
+  check((await readdir(path.join(FIX, 'pack'))).includes('empty'), 'empty sub-folders are copied too')
+
+  console.log('drop name clashes')
+  await drop('.row[data-path="zeta"]', [{ name: 'dropped.txt', content: 'other' }])
+  await dialog().waitFor()
+  check((await dialog().locator('h2').textContent()).includes("'dropped.txt' already exists"), 'a clash asks what to do')
+  check((await dialog().locator('[data-all]').count()) === 0, 'no "apply to all" for a single clash')
+  await page.screenshot({ path: path.join(SHOTS, '10-clash.png') })
+  await dialog().locator('[data-a="keep"]').click()
+  const nameInput = page.locator('.dialog-input')
+  await nameInput.waitFor()
+  check((await nameInput.inputValue()) === 'dropped copy.txt', 'keep both suggests "name copy.ext"', await nameInput.inputValue())
+  const sel = await nameInput.evaluate((i) => i.value.slice(i.selectionStart, i.selectionEnd))
+  check(sel === 'dropped copy', 'the suggested name is selected without its extension', sel)
+  await page.screenshot({ path: path.join(SHOTS, '11-keep-both-name.png') })
+  await nameInput.fill('dropped.txt')
+  await page.keyboard.press('Enter')
+  check(await waitFor(async () => (await page.locator('.dialog-error:not([hidden])').count()) === 1, 'err'), 'an existing name is refused in the name box')
+  await nameInput.fill('mine.txt')
+  await page.keyboard.press('Enter')
+  check(await waitFor(async () => (await zetaFile('mine.txt')) === 'other', 'disk'), 'keep both copies under the chosen name')
+  check((await zetaFile('dropped.txt')) === 'hello', 'keep both leaves the original alone')
+
+  await drop('.row[data-path="zeta"]', [{ name: 'dropped.txt', content: 'skipped' }])
+  await dialog().waitFor()
+  await dialog().locator('[data-a="skip"]').click()
+  await sleep(400)
+  check((await zetaFile('dropped.txt')) === 'hello', 'skip leaves the existing file')
+
+  await drop('.row[data-path="zeta"]', [{ name: 'dropped.txt', content: 'v2' }])
+  await dialog().waitFor()
+  await dialog().locator('[data-a="replace"]').click()
+  check(await waitFor(async () => (await zetaFile('dropped.txt')) === 'v2', 'disk', 15000), 'replace swaps in the dropped file')
+  check(
+    await waitFor(async () => !(await readdir(path.join(FIX, 'zeta'))).some((n) => n.endsWith('.tmp')), 'tmp', 4000),
+    'no temporary file is left behind'
+  )
+
+  await drop('.row[data-path="zeta"]', [
+    { name: 'dropped.txt', content: 'x' },
+    { name: 'mine.txt', content: 'y' },
+    { name: 'fresh.txt', content: 'z' }
+  ])
+  await dialog().waitFor()
+  check((await dialog().locator('[data-all]').count()) === 1, 'several clashes offer "apply to all"')
+  await dialog().locator('[data-all]').check()
+  await dialog().locator('[data-a="keep"]').click()
+  check(
+    await waitFor(
+      async () => (await zetaFile('dropped copy.txt')) === 'x' && (await zetaFile('mine copy.txt')) === 'y' && (await zetaFile('fresh.txt')) === 'z',
+      'disk'
+    ),
+    'keep both for all names every copy without asking'
+  )
+  check((await page.locator('.dialog-input').count()) === 0, 'no name box with "apply to all"')
+
+  await drop('.row[data-path="zeta"]', [{ name: 'fresh.txt', content: 'never' }])
+  await dialog().waitFor()
+  await page.keyboard.press('Escape')
+  await sleep(300)
+  check((await page.locator('.backdrop').count()) === 0 && (await zetaFile('fresh.txt')) === 'z', 'escape cancels the whole drop')
 
   console.log('big folder')
   await mkdir(path.join(FIX, 'big'))

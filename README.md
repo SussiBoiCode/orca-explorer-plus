@@ -20,9 +20,13 @@ explorer, and does the same file work.
 - **Files**: click to open in Orca's editor; **New File / New Folder** (+ in the header, or
   right-click); **Rename** (Enter or F2); **Delete** (Del) moves to the Recycle Bin / Trash without
   asking, like Orca's explorer, and offers a permanent delete only if that fails; **Reveal in
-  File Explorer**; **Copy Path / Copy Relative Path**.
+  File Explorer** (or Alt+click a row); **Copy Path / Copy Relative Path**.
 - **Multi-select** with Ctrl/Cmd-click and Shift-click, **drag and drop** to move (onto a folder,
   or a file to use its folder), and a **filter box** that searches the whole tree by name.
+- **Drop files or folders from File Explorer / Finder** to copy them in, with a progress toast.
+  On a name clash you pick **Keep both** (you name the copy, 'name copy.ext' suggested),
+  **Replace** (the old one goes to the Recycle Bin / Trash) or **Skip**, optionally for every clash.
+- Uses the **app font picked in Orca's Settings → Appearance**, and follows changes live.
 - **Live**: files that agents create, change or delete show up within about a second.
 - Hidden like Orca's explorer: `.git` and `node_modules`. Dotfiles and git-ignored files show.
 - Fast on big repos: folders load when you open them and only visible rows are drawn

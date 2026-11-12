@@ -869,6 +869,357 @@ async function movePaths(paths, destDir) {
   }
 }
 
+// ---------- copying in files dropped from the OS ----------
+// The frame never learns where a dropped file lives on disk, so each one is read here and sent to
+// the worker in chunks. Folders come through the File System Entry API.
+
+const CHUNK_BYTES = 512 * 1024 // ~700 KB as base64: well under the request cap
+let importQueue = Promise.resolve()
+
+/** The dropped top-level items: { name, entry } (a file or folder) or { name, file } (no entry API). */
+function droppedItems(dataTransfer) {
+  const items = []
+  for (const item of dataTransfer.items ?? []) {
+    if (item.kind !== 'file') continue
+    const entry = item.webkitGetAsEntry?.() ?? null
+    if (entry) {
+      items.push({ name: entry.name, dir: entry.isDirectory, entry })
+    } else {
+      const file = item.getAsFile()
+      if (file) items.push({ name: file.name, dir: false, file })
+    }
+  }
+  if (items.length === 0) {
+    for (const file of dataTransfer.files ?? []) items.push({ name: file.name, dir: false, file })
+  }
+  return items
+}
+
+function entryFile(entry) {
+  return new Promise((resolve, reject) => entry.file(resolve, reject))
+}
+
+async function readAllEntries(dirEntry) {
+  const reader = dirEntry.createReader()
+  const all = []
+  // readEntries hands back at most ~100 at a time; an empty batch means done.
+  for (;;) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject))
+    if (batch.length === 0) return all
+    all.push(...batch)
+  }
+}
+
+/** Flattens one dropped item into ordered steps: folders before what they hold. */
+async function planItem(item, destRel, steps) {
+  if (!item.entry) {
+    steps.push({ kind: 'file', rel: destRel, file: item.file })
+    return
+  }
+  if (item.entry.isFile) {
+    steps.push({ kind: 'file', rel: destRel, file: await entryFile(item.entry) })
+    return
+  }
+  steps.push({ kind: 'dir', rel: destRel })
+  for (const child of await readAllEntries(item.entry)) {
+    await planItem({ name: child.name, dir: child.isDirectory, entry: child }, join(destRel, child.name), steps)
+  }
+}
+
+function blobBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const url = String(reader.result)
+      resolve(url.slice(url.indexOf(',') + 1))
+    }
+    reader.onerror = () => reject(reader.error ?? new Error('could not read the file'))
+    reader.readAsDataURL(blob)
+  })
+}
+
+/** A toast that stays up and can be rewritten; `close` removes it. */
+function progressToast(message) {
+  const el = document.createElement('div')
+  el.className = 'toast progress'
+  el.innerHTML = '<span class="toast-text"></span><span class="toast-bar"><span></span></span>'
+  $('toasts').appendChild(el)
+  const text = el.querySelector('.toast-text')
+  const bar = el.querySelector('.toast-bar > span')
+  const update = (msg, fraction) => {
+    text.textContent = msg
+    bar.style.width = `${Math.round(Math.max(0, Math.min(1, fraction)) * 100)}%`
+  }
+  update(message, 0)
+  return { update, close: () => el.remove() }
+}
+
+function importDropped(items, destDir) {
+  importQueue = importQueue.then(() => runImport(items, destDir)).catch(() => {})
+  return importQueue
+}
+
+async function runImport(items, destDir) {
+  if (!state.ws) return
+  const root = state.ws.path
+  const ws = state.ws
+  let names
+  try {
+    const { conflicts } = await request('fs.conflicts', { root, dir: destDir, names: items.map((i) => i.name) })
+    names = new Map(conflicts.map((c) => [c.name, c]))
+  } catch (error) {
+    toast(`Copy failed: ${errorText(error)}`, true)
+    return
+  }
+
+  // Settle every name clash first, so the copy then runs without stopping.
+  const plan = [] // { item, name, replace }
+  let applyAll = null // the choice made with "apply to all"
+  const clashes = items.filter((i) => names.has(i.name)).length
+  let clashIndex = 0
+  for (const item of items) {
+    const clash = names.get(item.name)
+    if (!clash) {
+      plan.push({ item, name: item.name, replace: false })
+      continue
+    }
+    clashIndex++
+    let choice = applyAll
+    if (!choice) {
+      const answer = await clashDialog({
+        name: item.name,
+        dir: item.dir,
+        existingDir: clash.dir,
+        folderLabel: destDir ? baseName(destDir) : state.ws.name,
+        remaining: clashes - clashIndex
+      })
+      if (state.ws !== ws) return
+      if (answer.cancel) return
+      choice = answer.choice
+      if (answer.all) applyAll = choice
+    }
+    if (choice === 'skip') continue
+    if (choice === 'replace') {
+      plan.push({ item, name: item.name, replace: true })
+      continue
+    }
+    // Keep both: ask for the name, unless "apply to all" picks it.
+    let free
+    try {
+      free = (await request('fs.freeName', { root, dir: destDir, name: item.name, isDir: item.dir })).name
+    } catch (error) {
+      toast(errorText(error), true)
+      continue
+    }
+    if (applyAll) {
+      plan.push({ item, name: free, replace: false })
+      continue
+    }
+    const chosen = await nameDialog({ name: item.name, suggested: free, dir: item.dir, destDir })
+    if (state.ws !== ws) return
+    if (chosen === null) continue
+    plan.push({ item, name: chosen, replace: false })
+  }
+  if (plan.length === 0) return
+
+  const progress = progressToast('Preparing to copy…')
+  const done = []
+  try {
+    // A replacement is copied under a temporary name first; only once it is complete does the old
+    // item go to the Recycle Bin / Trash. So a failed copy loses nothing, and dropping a file onto
+    // its own folder (source = the item being replaced) still works.
+    const steps = []
+    for (const p of plan) {
+      p.top = join(destDir, p.replace ? `.${p.name}.explorer-plus-${Date.now().toString(36)}.tmp` : p.name)
+      const start = steps.length
+      try {
+        await planItem(p.item, p.top, steps)
+      } catch (error) {
+        steps.length = start
+        p.top = null
+        toast(`Couldn't read '${p.item.name}': ${errorText(error)}`, true)
+      }
+    }
+    const files = steps.filter((s) => s.kind === 'file')
+    const totalBytes = files.reduce((n, s) => n + s.file.size, 0) || 1
+    let sentBytes = 0
+    let fileNo = 0
+    const failedTops = new Set()
+    for (const step of steps) {
+      if (state.ws !== ws) throw new Error('the workspace changed')
+      const top = plan.find((p) => p.top && (step.rel === p.top || isUnder(step.rel, p.top)))
+      if (top && failedTops.has(top.top)) continue
+      try {
+        if (step.kind === 'dir') {
+          await request('fs.mkdir', { root, path: step.rel })
+          continue
+        }
+        fileNo++
+        const file = step.file
+        const label = `Copying ${fileNo} of ${files.length}: ${baseName(top && step.rel === top.top ? top.name : step.rel)}`
+        progress.update(label, sentBytes / totalBytes)
+        if (file.size === 0) {
+          await request('fs.write', { root, path: step.rel, data: '', append: false })
+        }
+        for (let offset = 0; offset < file.size; offset += CHUNK_BYTES) {
+          const data = await blobBase64(file.slice(offset, offset + CHUNK_BYTES))
+          try {
+            await request('fs.write', { root, path: step.rel, data, append: offset > 0 }, 60_000)
+          } catch (error) {
+            // A half-written file is worse than none.
+            if (offset > 0) await request('fs.deletePermanently', { root, paths: [step.rel] }).catch(() => {})
+            throw error
+          }
+          sentBytes += Math.min(CHUNK_BYTES, file.size - offset)
+          progress.update(label, sentBytes / totalBytes)
+        }
+      } catch (error) {
+        toast(`Couldn't copy '${baseName(step.rel === top?.top ? top.name : step.rel)}': ${errorText(error)}`, true)
+        // A replacement must arrive whole, or the old item stays.
+        if (top && (step.rel === top.top || top.replace)) failedTops.add(top.top)
+      }
+    }
+    for (const p of plan) {
+      if (!p.top) continue
+      if (failedTops.has(p.top)) {
+        if (p.replace) await request('fs.deletePermanently', { root, paths: [p.top] }).catch(() => {})
+        continue
+      }
+      if (p.replace) {
+        const final = join(destDir, p.name)
+        try {
+          const { failed } = await request('fs.trash', { root, paths: [final] }, 120_000)
+          if (failed.length) throw new Error(failed[0].error)
+          await request('fs.rename', { root, from: p.top, name: p.name })
+        } catch (error) {
+          await request('fs.deletePermanently', { root, paths: [p.top] }).catch(() => {})
+          toast(`Couldn't replace '${p.name}': ${errorText(error)}`, true)
+          continue
+        }
+        done.push(final)
+      } else {
+        done.push(p.top)
+      }
+    }
+  } catch (error) {
+    toast(`Copy stopped: ${errorText(error)}`, true)
+  } finally {
+    progress.close()
+  }
+  if (state.ws !== ws || done.length === 0) return
+  await loadDir(destDir, { force: true })
+  if (destDir) {
+    state.expanded.add(destDir)
+    saveExpanded()
+  }
+  state.selection = new Set(done)
+  state.cursor = done[0]
+  state.anchor = done[0]
+  revealPath(done[0])
+  toast(done.length === 1 ? `Copied '${baseName(done[0])}'.` : `Copied ${done.length} items.`)
+}
+
+/** Replace / Keep both / Skip for one name clash. Resolves { choice, all } or { cancel: true }. */
+function clashDialog({ name, dir, existingDir, folderLabel, remaining }) {
+  return new Promise((resolve) => {
+    const back = document.createElement('div')
+    back.className = 'backdrop'
+    const what = existingDir ? 'A folder' : 'A file'
+    const replaceNote = `The existing ${existingDir ? 'folder' : 'file'} goes to the ${trashName()}.`
+    back.innerHTML = `<div class="dialog" role="alertdialog" aria-modal="true" aria-labelledby="dlg-t" aria-describedby="dlg-b">
+      <h2 id="dlg-t">${esc(`'${name}' already exists`)}</h2>
+      <p id="dlg-b">${esc(`${what} with this name is already in '${folderLabel}'. ${replaceNote}`)}</p>
+      ${remaining > 0 ? `<label class="check-row"><input type="checkbox" data-all /> <span>${esc(`Do this for the next ${remaining} clash${remaining === 1 ? '' : 'es'} too`)}</span></label>` : ''}
+      <div class="actions stack"><button class="btn primary" data-a="keep" type="button">Keep both</button><button class="btn" data-a="replace" type="button">Replace</button><button class="btn" data-a="skip" type="button">Skip</button><button class="btn ghost" data-a="cancel" type="button">Cancel</button></div></div>`
+    const done = (value) => {
+      back.remove()
+      treeEl.focus()
+      resolve(value)
+    }
+    const all = () => Boolean(back.querySelector('[data-all]')?.checked)
+    back.addEventListener('click', (event) => {
+      const a = event.target.closest('[data-a]')?.dataset.a
+      if (a === 'cancel' || event.target === back) done({ cancel: true })
+      else if (a === 'skip') done({ choice: 'skip', all: all() })
+      else if (a === 'keep') done({ choice: 'keep', all: all() })
+      else if (a === 'replace') done({ choice: 'replace', all: all() })
+    })
+    back.addEventListener('keydown', (event) => {
+      event.stopPropagation()
+      if (event.key === 'Escape') done({ cancel: true })
+    })
+    document.body.appendChild(back)
+    back.querySelector('[data-a="keep"]').focus()
+  })
+}
+
+/** Asks the name for a kept copy, pre-filled with `suggested`. Resolves the name, or null to skip. */
+function nameDialog({ name, suggested, dir, destDir }) {
+  return new Promise((resolve) => {
+    const back = document.createElement('div')
+    back.className = 'backdrop'
+    back.innerHTML = `<div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dlg-t">
+      <h2 id="dlg-t">${esc(`Name for the copy of '${name}'`)}</h2>
+      <input class="dialog-input" type="text" spellcheck="false" autocomplete="off" aria-label="New name" />
+      <div class="dialog-error" hidden></div>
+      <div class="actions"><button class="btn" data-a="skip" type="button">Skip</button><button class="btn primary" data-a="ok" type="button">Copy</button></div></div>`
+    const input = back.querySelector('input')
+    const errorEl = back.querySelector('.dialog-error')
+    input.value = suggested
+    let busy = false
+    const done = (value) => {
+      back.remove()
+      treeEl.focus()
+      resolve(value)
+    }
+    const showError = (message) => {
+      errorEl.textContent = message
+      errorEl.hidden = false
+      input.focus()
+    }
+    const submit = async () => {
+      if (busy) return
+      const value = input.value.trim()
+      if (!value) return showError('A name must be provided.')
+      if (/[\\/]/.test(value)) return showError('A name cannot contain / or \\.')
+      if (isWindowsPath(state.ws?.path ?? '') && /[<>:"|?*]/.test(value)) {
+        return showError('A name cannot contain < > : " | ? or *.')
+      }
+      busy = true
+      try {
+        const { conflicts } = await request('fs.conflicts', { root: state.ws.path, dir: destDir, names: [value] })
+        if (conflicts.length) return showError(`'${value}' already exists here.`)
+        done(value)
+      } catch (error) {
+        showError(errorText(error))
+      } finally {
+        busy = false
+      }
+    }
+    back.addEventListener('click', (event) => {
+      const a = event.target.closest('[data-a]')?.dataset.a
+      if (a === 'ok') submit()
+      else if (a === 'skip' || event.target === back) done(null)
+    })
+    back.addEventListener('keydown', (event) => {
+      event.stopPropagation()
+      if (event.key === 'Escape') done(null)
+      else if (event.key === 'Enter') {
+        event.preventDefault()
+        submit()
+      }
+    })
+    input.addEventListener('input', () => {
+      errorEl.hidden = true
+    })
+    document.body.appendChild(back)
+    input.focus()
+    // Select the name without its extension, as rename does.
+    const dot = dir ? -1 : suggested.lastIndexOf('.')
+    input.setSelectionRange(0, dot > 0 ? dot : suggested.length)
+  })
+}
+
 function copyText(text) {
   const area = document.createElement('textarea')
   area.value = text
@@ -1086,6 +1437,7 @@ function rowMenuItems(row) {
   items.push({
     label: IS_MAC ? 'Reveal in Finder' : isWindowsPath(state.ws.path) ? 'Reveal in File Explorer' : 'Open Containing Folder',
     icon: 'ExternalLink',
+    shortcut: IS_MAC ? '⌥Click' : 'Alt+Click',
     run: () => reveal(row.path)
   })
   items.push('sep')
@@ -1189,6 +1541,13 @@ treeEl.addEventListener('click', (event) => {
     return
   }
   treeEl.focus({ preventScroll: true })
+  // Alt+click: select the row and show it in the OS file manager, without opening or toggling it.
+  if (event.altKey && !event.shiftKey && !event.ctrlKey && !event.metaKey) {
+    event.preventDefault()
+    selectOnly(row.path)
+    reveal(row.path)
+    return
+  }
   const mod = IS_MAC ? event.metaKey : event.ctrlKey
   if (event.shiftKey && state.anchor) {
     rangeSelect(row.path, mod)
@@ -1343,7 +1702,15 @@ treeEl.addEventListener('dragstart', (event) => {
   }
 })
 
+/** Files dragged in from outside Orca (File Explorer, Finder, the desktop). */
+function isOsFileDrag(event) {
+  return !state.drag && state.status === 'ready' && [...(event.dataTransfer?.types ?? [])].includes('Files')
+}
+
 treeEl.addEventListener('dragover', (event) => {
+  if (isOsFileDrag(event)) {
+    state.drag = { paths: [], external: true, overDir: null, hoverPath: null, hoverTimer: null }
+  }
   if (!state.drag) return
   const dest = dropDirFor(event)
   const invalid = state.drag.paths.some((p) => dest === p || isUnder(dest, p))
@@ -1353,7 +1720,7 @@ treeEl.addEventListener('dragover', (event) => {
     return
   }
   event.preventDefault()
-  event.dataTransfer.dropEffect = 'move'
+  event.dataTransfer.dropEffect = state.drag.external ? 'copy' : 'move'
   setDragOver(dest)
   // Hovering a closed folder opens it, as in Orca's explorer.
   const row = rowFromEvent(event)
@@ -1376,17 +1743,37 @@ function setDragOver(dir) {
 }
 
 treeEl.addEventListener('dragleave', (event) => {
-  if (state.drag && !treeEl.contains(event.relatedTarget)) setDragOver(null)
+  if (!state.drag || treeEl.contains(event.relatedTarget)) return
+  // An OS drag gets no dragend here, so leaving the tree ends it.
+  if (state.drag.external) endDrag()
+  else setDragOver(null)
 })
 
 treeEl.addEventListener('drop', (event) => {
   if (!state.drag) return
   event.preventDefault()
   const dest = dropDirFor(event)
-  const paths = state.drag.paths
+  const { paths, external } = state.drag
+  if (external) {
+    // Entries must be taken while the drop event runs; the DataTransfer empties after it.
+    const dropped = droppedItems(event.dataTransfer)
+    endDrag()
+    if (dropped.length) importDropped(dropped, dest)
+    return
+  }
   endDrag()
   if (!paths.some((p) => dest === p || isUnder(dest, p))) movePaths(paths, dest)
 })
+
+// A file dropped outside the tree must not navigate the frame to it.
+for (const type of ['dragover', 'drop']) {
+  document.addEventListener(type, (event) => {
+    if (!treeEl.contains(event.target) && [...(event.dataTransfer?.types ?? [])].includes('Files')) {
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'none'
+    }
+  })
+}
 
 treeEl.addEventListener('dragend', endDrag)
 
@@ -1551,6 +1938,47 @@ orca.plugin.on('fs.changed', ({ root, dirs, all }) => {
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && state.status === 'ready') reloadAll()
 })
+
+// ---------- Orca's app font ----------
+// Frames get no font from Orca, so the worker reads Settings → Appearance → app font and the
+// panel builds the same stack Orca's window uses (src/renderer/.../app-font-family.ts).
+
+const FONT_POLL_MS = 5000
+const DEFAULT_APP_FONT = 'Geist'
+const APP_FONT_FALLBACKS = [DEFAULT_APP_FONT, '-apple-system', 'BlinkMacSystemFont', 'Segoe UI', 'sans-serif']
+const CSS_FONT_KEYWORDS = new Set(['serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', 'blinkmacsystemfont'])
+
+function buildAppFontFamily(family) {
+  const trimmed = family?.trim() || DEFAULT_APP_FONT
+  const lower = trimmed.toLowerCase()
+  const parts = [trimmed, ...APP_FONT_FALLBACKS.filter((f) => f.toLowerCase() !== lower)]
+  return parts.map((f) => (f.startsWith('-') || CSS_FONT_KEYWORDS.has(f.toLowerCase()) ? f : JSON.stringify(f))).join(', ')
+}
+
+let appFont = null
+function applyAppFont(family) {
+  if (family === appFont) return
+  appFont = family
+  document.documentElement.style.setProperty('--app-font', buildAppFontFamily(family))
+  save('xp:font', family)
+}
+
+async function syncAppFont() {
+  try {
+    const { family } = await request('app.font')
+    if (typeof family === 'string') applyAppFont(family)
+  } catch {
+    // Keep the last known font.
+  }
+}
+
+// The last font seen, at once, so the panel doesn't flash Geist before the worker answers.
+const savedFont = load('xp:font', null)
+if (typeof savedFont === 'string') applyAppFont(savedFont)
+syncAppFont()
+setInterval(() => document.visibilityState === 'visible' && syncAppFont(), FONT_POLL_MS)
+window.addEventListener('focus', syncAppFont)
+document.addEventListener('visibilitychange', () => document.visibilityState === 'visible' && syncAppFont())
 
 orca.on('workspace.changed', ({ context }) => onContext(context))
 render()
